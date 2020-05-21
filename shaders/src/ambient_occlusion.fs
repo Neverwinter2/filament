@@ -11,11 +11,50 @@
 // Ambient occlusion helpers
 //------------------------------------------------------------------------------
 
+float unpack(vec2 depth) {
+    // this is equivalent to (x8 * 256 + y8) / 65535, which gives a value between 0 and 1
+    return (depth.x * (256.0 / 257.0) + depth.y * (1.0 / 257.0));
+}
+
 float evaluateSSAO() {
-    // Note: Here we are essentially upscalling the SSAO buffer using a bilinear filter,
-    // but it would be better to apply a bilateral filter. It's a bit too expensive on mobile
-    // though.
-    return textureLod(light_ssao, uvToRenderTargetUV(getNormalizedViewportCoord().xy), 0.0).r;
+    highp vec2 uv = uvToRenderTargetUV(getNormalizedViewportCoord().xy);
+
+    // Upscale the SSAO buffer in real-time, in high quality mode we use a custom bilinear
+    // filter, and we only do this if we have textureGather (ES3.1)
+    // This adds about 2.5ms @ 250MHz on Pixel 4
+
+#if !defined(GL_ES) || (defined(GL_ES) && __VERSION__ >= 310)
+    if (frameUniforms.aoSamplingQuality > 0.0) {
+        // Read 4 AO and depths values
+        vec4 ao = textureGather(light_ssao, uv, 0); // 01, 11, 10, 00
+        vec4 dg = textureGather(light_ssao, uv, 1); // 01, 11, 10, 00
+        vec4 db = textureGather(light_ssao, uv, 2); // 01, 11, 10, 00
+
+        // bilinear weights
+        vec2 f = fract(uv * vec2(textureSize(light_ssao, 0)));
+        vec4 b;
+        b.x = f.x * (1.0 - f.y);
+        b.y = (1.0 - f.x) * (1.0 - f.y);
+        b.z = (1.0 - f.x) * f.y;
+        b.w = f.x * f.y;
+
+        // bilateral weights
+        vec4 depths;
+        depths.x = unpack(vec2(dg.x, db.x));
+        depths.y = unpack(vec2(dg.y, db.y));
+        depths.z = unpack(vec2(dg.z, db.z));
+        depths.w = unpack(vec2(dg.w, db.w));
+        depths *= -frameUniforms.cameraFar;
+        float d = (getViewFromWorldMatrix() * vec4(getWorldPosition(), 1.0)).z;
+        const float oneOverEdgeDistance = 1.0 / 0.0625;// TODO: don't hardcode this
+        vec4 w = (vec4(d) - depths) * oneOverEdgeDistance;
+        w = max(vec4(0.0), 1.0 - w * w) * b;
+        return dot(ao, w) * (1.0 / (w.x + w.y + w.z + w.w));
+    } else
+#endif
+    {
+        return textureLod(light_ssao, uv, 0.0).r;
+    }
 }
 
 float SpecularAO_Lagarde(float NoV, float visibility, float roughness) {
